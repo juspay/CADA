@@ -29,6 +29,71 @@ import Language.Haskell.Tools.PrettyPrint
 import Data.Text.Encoding
 import Data.Generics.Uniplate.Data ()
 import Control.Reference ((^.), (!~), biplateRef,(^?))
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString.Builder as BB
+import System.IO (IOMode(WriteMode), hSetBuffering, BufferMode(BlockBuffering), hClose, openFile)
+import Control.Concurrent.Async (mapConcurrently)
+
+-- Helper function to write file with proper buffering
+writeFileBuffered :: FilePath -> BL.ByteString -> IO ()
+writeFileBuffered path contents = do
+    handle <- openFile path WriteMode
+    hSetBuffering handle (BlockBuffering (Just 8192)) -- 8KB buffer size
+    BL.hPut handle contents
+    hClose handle
+
+
+--TODO: NEED TO GET FROM CABAL.PROJECT
+determineNewPath :: String -> String
+determineNewPath filePath
+    | "euler-x" `isInfixOf` filePath = "euler-x/"
+    | "oltp" `isInfixOf` filePath = "oltp/"
+    | "dbTypes" `isInfixOf` filePath = "dbTypes/"
+    | "ecPrelude" `isInfixOf` filePath = "ecPrelude/"
+    | "euler-api-decider" `isInfixOf` filePath = "euler-api-decider/"
+    | "app/alchemist" `isInfixOf` filePath = "app/alchemist/"
+    | "app/provider-platform/dynamic-offer-driver-drainer" `isInfixOf` filePath = "app/provider-platform/dynamic-offer-driver-drainer/"
+    | "app/beckn-cli" `isInfixOf` filePath = "app/beckn-cli/"
+    | "app/provider-platform/dynamic-offer-driver-app/Main" `isInfixOf` filePath = "app/provider-platform/dynamic-offer-driver-app/Main/"
+    | "app/provider-platform/dynamic-offer-driver-app/Allocator" `isInfixOf` filePath = "app/provider-platform/dynamic-offer-driver-app/Allocator/"
+    | "app/rider-platform/rider-app-drainer" `isInfixOf` filePath = "app/rider-platform/rider-app-drainer/"
+    | "app/rider-platform/rider-app/Main" `isInfixOf` filePath = "app/rider-platform/rider-app/Main/"
+    | "app/rider-platform/rider-app/Scheduler" `isInfixOf` filePath = "app/rider-platform/rider-app/Scheduler/"
+    | "app/rider-platform/rider-app/search-result-aggregator" `isInfixOf` filePath = "app/rider-platform/rider-app/search-result-aggregator/"
+    | "app/safety-dashboard" `isInfixOf` filePath = "app/safety-dashboard/"
+    | "app/mocks/sms" `isInfixOf` filePath = "app/mocks/sms/"
+    | "app/mocks/fcm" `isInfixOf` filePath = "app/mocks/fcm/"
+    | "app/dashboard/rider-dashboard" `isInfixOf` filePath = "app/dashboard/rider-dashboard/"
+    | "app/dashboard/provider-dashboard" `isInfixOf` filePath = "app/dashboard/provider-dashboard/"
+    | "app/dashboard/Lib" `isInfixOf` filePath = "app/dashboard/Lib/"
+    | "app/dashboard/CommonAPIs" `isInfixOf` filePath = "app/dashboard/CommonAPIs/"
+    | "app/example-service" `isInfixOf` filePath = "app/example-service/"
+    | "app/special-zone" `isInfixOf` filePath = "app/special-zone/"
+    | "app/sdk-event-pipeline" `isInfixOf` filePath = "app/sdk-event-pipeline/"
+    | "app/mocks/rider-platform" `isInfixOf` filePath = "app/mocks/rider-platform/"
+    | "app/kafka-consumers" `isInfixOf` filePath = "app/kafka-consumers/"
+    | "app/mocks/idfy" `isInfixOf` filePath = "app/mocks/idfy/"
+    | "app/mocks/google" `isInfixOf` filePath = "app/mocks/google/"
+    | "app/rider-platform/public-transport-rider-platform/Main" `isInfixOf` filePath = "app/rider-platform/public-transport-rider-platform/Main/"
+    | "app/rider-platform/public-transport-rider-platform/search-consumer" `isInfixOf` filePath = "app/rider-platform/public-transport-rider-platform/search-consumer/"
+    | "app/mocks/public-transport-provider-platform" `isInfixOf` filePath = "app/mocks/public-transport-provider-platform/"
+    | "app/utils/route-extractor" `isInfixOf` filePath = "app/utils/route-extractor/"
+    | "app/utils/image-api-helper" `isInfixOf` filePath = "app/utils/image-api-helper/"
+    | "lib/beckn-spec" `isInfixOf` filePath = "lib/beckn-spec/"
+    | "lib/beckn-services" `isInfixOf` filePath = "lib/beckn-services/"
+    | "lib/payment" `isInfixOf` filePath = "lib/payment/"
+    | "lib/shared-services" `isInfixOf` filePath = "lib/shared-services/"
+    | "lib/location-updates" `isInfixOf` filePath = "lib/location-updates/"
+    | "lib/special-zone" `isInfixOf` filePath = "lib/special-zone/"
+    | "lib/scheduler" `isInfixOf` filePath = "lib/scheduler/"
+    | "lib/sessionizer-metrics" `isInfixOf` filePath = "lib/sessionizer-metrics/"
+    | "lib/yudhishthira" `isInfixOf` filePath = "lib/yudhishthira/"
+    | "test" `isInfixOf` filePath = "test/"
+    | "lib/producer" `isInfixOf` filePath = "lib/producer/"
+    | "lib/utils" `isInfixOf` filePath = "lib/utils/"
+    | "lib/external" `isInfixOf` filePath = "lib/external/"
+    | "lib/webhook" `isInfixOf` filePath = "lib/webhook/"
+    | otherwise = ""
 
 extractModuleNames :: [FilePath] -> [(String, String)]
 extractModuleNames filePaths =
@@ -36,18 +101,7 @@ extractModuleNames filePaths =
     where
         extractModNameAndPath :: FilePath -> (String, String)
         extractModNameAndPath filePath = do
-            let newPath =
-                    if "euler-x" `isInfixOf` filePath 
-                        then "euler-x/" 
-                        else if "oltp" `isInfixOf` filePath 
-                            then "oltp/" 
-                        else if "dbTypes" `isInfixOf` filePath 
-                            then "dbTypes/" 
-                        else if "ecPrelude" `isInfixOf` filePath 
-                            then "ecPrelude/"
-                        else if "euler-api-decider" `isInfixOf` filePath 
-                            then "euler-api-decider/"
-                        else ""
+            let newPath = determineNewPath filePath
             case filePath =~ "src-generated/(.*).hs" :: (String, String, String, [String]) of
                 (_, _, _, [modName]) -> (map (\c -> if c == '/' then '.' else c) modName, newPath ++ "src-generated")
                 _                    ->
@@ -336,15 +390,13 @@ getAllChangesWithCode newFuns oldFuns addedFns
         let deletedKeys = HM.keys $ HM.difference old new
         in [(k, getDeclSourceCode decl) | k <- deletedKeys, Just decl <- [HM.lookup k old]]
 
--- Updated function to create detailed files
+-- Updated function to create detailed files with optimized writing
 createCodeFiles :: [DetailedChanges] -> IO ()
 createCodeFiles changes = do
-    -- Write the pretty-printed detailed JSON
-    writeFile "all_code_changes.json" 
-        (toString $ encodePretty changes)
+    -- Create all JSON values first (compute once, reuse multiple times)
+    let allChangesJson = encodePretty changes
     
-    -- Create separate files for functions, types, and instances
-    let allFunctionChanges = object [
+    let functionChangesJson = encodePretty $ object [
             T.pack "added" .= concatMap (\c -> map (\(name, code) -> 
                                      object [T.pack "module" .= moduleName c, 
                                             T.pack "name" .= name, 
@@ -363,7 +415,7 @@ createCodeFiles changes = do
                                        (deletedFunctions c)) changes
             ]
         
-    let allTypeChanges = object [
+    let typeChangesJson = encodePretty $ object [
             T.pack "added" .= concatMap (\c -> map (\(name, code) -> 
                                      object [T.pack "module" .= moduleName c, 
                                             T.pack "name" .= name, 
@@ -382,7 +434,7 @@ createCodeFiles changes = do
                                        (deletedTypes c)) changes
             ]
         
-    let allInstanceChanges = object [
+    let instanceChangesJson = encodePretty $ object [
             T.pack "added" .= concatMap (\c -> map (\(name, code) -> 
                                      object [T.pack "module" .= moduleName c, 
                                             T.pack "name" .= name, 
@@ -401,10 +453,20 @@ createCodeFiles changes = do
                                        (deletedInstances c)) changes
             ]
     
-    -- Write separate files for each type
-    writeFile "function_changes.json" (toString $ encodePretty allFunctionChanges)
-    writeFile "type_changes.json" (toString $ encodePretty allTypeChanges)
-    writeFile "instance_changes.json" (toString $ encodePretty allInstanceChanges)
+    -- Write files concurrently
+    mapConcurrently_ (\(filepath, content) -> writeFileBuffered filepath content)
+        [ ("all_code_changes.json", allChangesJson)
+        , ("function_changes.json", functionChangesJson)
+        , ("type_changes.json", typeChangesJson)
+        , ("instance_changes.json", instanceChangesJson)
+        ]
+    
+    where
+        -- Helper function for concurrent writes without collecting results
+        mapConcurrently_ f = void . mapConcurrently f
+
+write :: FilePath -> BL.ByteString -> IO ()
+write path contents = writeFileBuffered path contents
 
 getDeclSourceCode :: Ann AST.UDecl (Dom GhcPs) SrcTemplateStage -> String
 getDeclSourceCode decl = prettyPrint decl
