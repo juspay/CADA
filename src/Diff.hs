@@ -288,8 +288,14 @@ run = do
         compareCalledFunctions oldDecl newDecl =
             let oldCalls = extractFunctionCalls oldDecl
                 newCalls = extractFunctionCalls newDecl
-                added_functions = [call | call <- newCalls, call `notElem` oldCalls]
-                removed_functions = [call | call <- oldCalls, call `notElem` newCalls]
+                added_functions =
+                    [ fn | (fn, newCount) <- Map.toList newCalls
+                        , let oldCount = Map.findWithDefault 0 fn oldCalls
+                        , newCount > oldCount ]
+                removed_functions =
+                    [ fn | (fn, oldCount) <- Map.toList oldCalls
+                        , let newCount = Map.findWithDefault 0 fn newCalls
+                        , oldCount > newCount ]
                 oldlits = extractLiteralsCalls oldDecl
                 newlits = extractLiteralsCalls newDecl
                 added_literals = [call | call <- newlits, call `notElem` oldlits]
@@ -314,8 +320,8 @@ run = do
         extractFunctionCalls decl =
             let exprs = decl ^? biplateRef :: [Ann UExpr (Dom GhcPs) SrcTemplateStage]
                 names = decl ^? biplateRef :: [Ann UName (Dom GhcPs) SrcTemplateStage]
-                calls = concatMap extractCallsFromExpr exprs
-            in nub (calls <> (concatMap extractNames names))
+                calls = concatMap extractCallsFromExpr exprs <>(concatMap extractNames names)
+            in Map.fromListWith (+) [(c, 1) | c <- calls]
 
         extractLiterals :: Ann ULiteral (Dom GhcPs) SrcTemplateStage -> [(String,String)]
         extractLiterals name =
