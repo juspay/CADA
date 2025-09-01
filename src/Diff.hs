@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns,DeriveGeneric #-}
+{-# LANGUAGE BangPatterns,DeriveGeneric #-}
 
 module Diff where
 
@@ -8,10 +9,12 @@ import Control.Exception
 import Control.Monad
 import qualified Data.HashMap.Strict as HM
 import Data.Maybe (catMaybes,mapMaybe)
+import Data.Maybe (catMaybes,mapMaybe)
 import Data.List
 import qualified Data.Text as T
 import GHC.Hs.Extension
 import qualified Language.Haskell.Tools.AST as AST
+import Language.Haskell.Tools.AST
 import Language.Haskell.Tools.AST
 import Language.Haskell.Tools.Parser.FlowChange (compareASTForFuns, getAllFunctions, addFunctionModifed, FunctionModified(..))
 import Language.Haskell.Tools.Parser.ParseModule (moduleParser)
@@ -32,12 +35,45 @@ import Control.Reference ((^.), (!~), biplateRef,(^?))
 import Language.Haskell.Tools.AST.Ann
 import SrcLoc (SrcSpan(..), noSrcSpan,srcSpanStartLine,srcSpanStartCol,srcSpanEndLine,srcSpanEndCol,srcSpanFile)
 import FastString (unpackFS)
+import GHC.Generics (Generic)
+import Data.Aeson.Encode.Pretty
+import Language.Haskell.Tools.PrettyPrint
+import Data.Text.Encoding
+import Data.Generics.Uniplate.Data ()
+import Control.Reference ((^.), (!~), biplateRef,(^?))
+import Language.Haskell.Tools.AST.Ann
+import SrcLoc (SrcSpan(..), noSrcSpan,srcSpanStartLine,srcSpanStartCol,srcSpanEndLine,srcSpanEndCol,srcSpanFile)
+import FastString (unpackFS)
 extractModuleNames :: [FilePath] -> [(String, String)]
 extractModuleNames filePaths =
     filter (\(m, _) -> m /= "NA") (map (\x -> extractModNameAndPath x) filePaths)
     where
         extractModNameAndPath :: FilePath -> (String, String)
         extractModNameAndPath filePath = do
+            let newPath =
+                    if "euler-x" `isInfixOf` filePath 
+                        then "euler-x/" 
+                        else if "oltp" `isInfixOf` filePath 
+                            then "oltp/" 
+                        else if "dbTypes" `isInfixOf` filePath 
+                            then "dbTypes/" 
+                        else if "ecPrelude" `isInfixOf` filePath 
+                            then "ecPrelude/"
+                        else if "euler-api-decider" `isInfixOf` filePath 
+                            then "euler-api-decider/"
+                        else ""
+            case filePath =~ "src-generated/(.*).hs" :: (String, String, String, [String]) of
+                (_, _, _, [modName]) -> (map (\c -> if c == '/' then '.' else c) modName, newPath ++ "src-generated")
+                _                    ->
+                    case filePath =~ ".*/src-generated/(.*).hs" :: (String, String, String, [String]) of
+                        (_, _, _, [modName]) -> (map (\c -> if c == '/' then '.' else c) modName, newPath ++ "src-generated")
+                        _                    ->
+                            case filePath =~ ".*src/(.*).hs" :: (String, String, String, [String]) of
+                                (_, _, _, [modName]) -> (map (\c -> if c == '/' then '.' else c) modName,newPath ++ "src")
+                                _                    -> 
+                                    case filePath =~ ".*src-extras/(.*).hs" :: (String, String, String, [String]) of
+                                        (_, _, _, [modName]) -> (map (\c -> if c == '/' then '.' else c) modName, newPath ++ "src-extras")
+                                        _                    -> ("NA", "NA")
             let newPath =
                     if "euler-x" `isInfixOf` filePath 
                         then "euler-x/" 
@@ -173,6 +209,101 @@ traverseOverInstance decl@(Ann _ d) =
 --     _ -> Nothing
 
 -- Update the run function to handle types and instances
+-- Function to get all declarations by type
+getAllTypeDecls :: Ann AST.UModule (Dom GhcPs) SrcTemplateStage -> [(String, Ann AST.UDecl (Dom GhcPs) SrcTemplateStage)]
+getAllTypeDecls moduleAST = mapMaybe traverseOverTypeDecl (moduleAST ^? biplateRef)
+
+-- Function to get all instances
+getAllInstances :: Ann AST.UModule (Dom GhcPs) SrcTemplateStage -> [(String, Ann AST.UDecl (Dom GhcPs) SrcTemplateStage)]
+getAllInstances moduleAST = mapMaybe traverseOverInstance (moduleAST ^? biplateRef)
+
+-- Extract type declaration name
+traverseOverTypeDecl :: Ann UDecl (Dom GhcPs) SrcTemplateStage -> Maybe (String, Ann UDecl (Dom GhcPs) SrcTemplateStage)
+traverseOverTypeDecl decl@(Ann _ d) = case d of
+    UTypeDecl { _declHead = Ann _ (UDeclHead (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) } -> 
+        Just (name, decl)
+    UDataDecl { _declHead = Ann _ (UDeclHead (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) } -> 
+        Just (name, decl)
+    UClassDecl { _declHead = Ann _ (UDeclHead (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) } -> 
+        Just (name, decl)
+    UTypeFamilyDecl { _declTypeFamily = Ann _ tf } -> 
+        case _tfHead tf of
+            Ann _ (UDeclHead (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) -> Just (name, decl)
+            _ -> Nothing
+    _ -> Nothing
+
+-- Extract instance name (class name + instance types)
+traverseOverInstance :: Ann UDecl (Dom GhcPs) SrcTemplateStage -> Maybe (String, Ann UDecl (Dom GhcPs) SrcTemplateStage)
+traverseOverInstance decl@(Ann _ d) = 
+    case d of
+        UInstDecl {} -> getInstanceDetails decl
+        UDerivDecl {} -> getInstanceDetails decl
+        UTypeInstDecl {} -> getInstanceDetails decl
+        UDataInstDecl {} -> getInstanceDetails decl
+        UGDataInstDecl {} -> getInstanceDetails decl
+        _ -> Nothing
+  where
+    getInstanceDetails :: Ann UDecl (Dom GhcPs) SrcTemplateStage -> Maybe (String, Ann UDecl (Dom GhcPs) SrcTemplateStage)
+    getInstanceDetails i@(Ann _ inst) =
+        let className = extractClassName inst
+            instanceId = extractTypeName inst
+        in Just (className<>"::"<>instanceId, i)
+
+    extractTypeName :: UDecl (Dom GhcPs) SrcTemplateStage -> String
+    extractTypeName (UInstDecl _ (Ann _ rule) _) = getTypeNameFromRule rule
+    extractTypeName (UDerivDecl _ _ (Ann _ rule)) = getTypeNameFromRule rule
+    extractTypeName (UTypeInstDecl (Ann _ rule) _) = getTypeNameFromRule rule
+    extractTypeName (UDataInstDecl _ (Ann _ rule) _ _) = getTypeNameFromRule rule
+    extractTypeName (UGDataInstDecl _ (Ann _ rule) _ _) = getTypeNameFromRule rule
+    extractTypeName _ = "UnknownType"
+
+    getTypeNameFromRule :: UInstanceRule (Dom GhcPs) SrcTemplateStage -> String
+    getTypeNameFromRule (UInstanceRule _ _ (Ann _ head')) = getTypeName head'
+
+    getTypeName :: UInstanceHead (Dom GhcPs) SrcTemplateStage -> String
+    getTypeName (UInstanceHeadCon _) = "Unknown" -- Just class, no applied type
+    getTypeName (UInstanceHeadParen (Ann _ head')) = getTypeName head'
+    getTypeName (UInstanceHeadInfix (Ann _ typ) _) = extractTypeString typ
+    getTypeName (UInstanceHeadApp (Ann _ _) (Ann _ typ)) = extractTypeString typ
+
+    extractTypeString :: UType (Dom GhcPs) SrcTemplateStage -> String
+    extractTypeString (UTyVar (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) = name
+    extractTypeString (UTyApp (Ann _ t1) _) = extractTypeString t1
+    extractTypeString (UTyParen (Ann _ t)) = extractTypeString t
+    extractTypeString _ = "Complex"
+
+    extractClassName :: UDecl (Dom GhcPs) SrcTemplateStage -> String
+    extractClassName (UInstDecl _ (Ann _ rule) _) = getRuleName rule
+    extractClassName (UDerivDecl _ _ (Ann _ rule)) = getRuleName rule
+    extractClassName (UTypeInstDecl (Ann _ rule) _) = getRuleName rule
+    extractClassName (UDataInstDecl _ (Ann _ rule) _ _) = getRuleName rule
+    extractClassName (UGDataInstDecl _ (Ann _ rule) _ _) = getRuleName rule
+    extractClassName _ = "UnknownInstance"
+    
+    getRuleName :: UInstanceRule (Dom GhcPs) SrcTemplateStage -> String
+    getRuleName (UInstanceRule _ _ (Ann _ head')) = getHeadName head'
+    
+    getHeadName :: UInstanceHead (Dom GhcPs) SrcTemplateStage -> String
+    getHeadName (UInstanceHeadCon (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) = name
+    getHeadName (UInstanceHeadApp (Ann _ head') _) = getHeadName head'
+    getHeadName (UInstanceHeadInfix _ (Ann _ (UNormalOp (Ann _ (UQualifiedName _ (Ann _ (UNamePart name))))))) = name
+    getHeadName (UInstanceHeadParen (Ann _ head')) = getHeadName head'
+    getHeadName _ = "UnknownClass"
+-- -- Extract instance name (class name + instance types)
+-- traverseOverInstance :: Ann UDecl (Dom GhcPs) SrcTemplateStage -> Maybe (String, Ann UDecl (Dom GhcPs) SrcTemplateStage)
+-- traverseOverInstance decl@(Ann _ d) =
+--     case d of
+--         UInstDecl { _declInstRule = Ann _ rule } -> do
+--             case rule of
+--                 UInstanceRule _ _ (Ann _ head') -> 
+--                     case head' of
+--                         UInstanceHeadCon (Ann _ (UNormalName (Ann _ (UQualifiedName _ (Ann _ (UNamePart className)))))) ->
+--                             Just (className ++ "_instance", decl)
+--                         _ -> Nothing
+--                 _ -> Nothing
+--     _ -> Nothing
+
+-- Update the run function to handle types and instances
 run :: IO ()
 run = do
     x <- getArgs
@@ -184,16 +315,49 @@ run = do
             print ("modified files: " <> show changedFiles)
             
             -- Get AST for previous commit
+            
+            -- Get AST for previous commit
             maybePreviousAST  <- mkAst modifiedModsAndPaths localRepoPath
+            
+            -- Switch to current commit
             
             -- Switch to current commit
             _                 <- readProcess "git" ["checkout", currentCommit] ""
             
             -- Get AST for current commit
+            
+            -- Get AST for current commit
             maybeCurrentAST   <- mkAst modifiedModsAndPaths localRepoPath
             
             -- Process differences for functions, types, and instances
+            
+            -- Process differences for functions, types, and instances
             let listOfAstTuple = zip maybePreviousAST maybeCurrentAST
+            listOfChanges <- mapM (\((moduleName, mPreviousAST), (_, mCurrentAST)) -> do
+                                    let currentFunctions = maybe [] getAllFunctions mCurrentAST
+                                        previousFunctions = maybe [] getAllFunctions mPreviousAST
+                                        currentTypes = maybe [] getAllTypeDecls mCurrentAST
+                                        previousTypes = maybe [] getAllTypeDecls mPreviousAST
+                                        currentInstances = maybe [] getAllInstances mCurrentAST
+                                        previousInstances = maybe [] getAllInstances mPreviousAST
+                                    pure $ (moduleName, 
+                                        HM.fromList currentFunctions, 
+                                        HM.fromList previousFunctions,
+                                        HM.fromList currentTypes,
+                                        HM.fromList previousTypes,
+                                        HM.fromList currentInstances,
+                                        HM.fromList previousInstances)) 
+                                 listOfAstTuple
+                
+                -- Process function changes for funs_modified.json (unchanged)
+            let funChanges = map (\(moduleName, currentFns, previousFns, _, _, _, _) -> 
+                                let addedFns = HM.keys $ HM.difference currentFns previousFns
+                                in getFunctionModifiedSimple currentFns previousFns addedFns moduleName) 
+                             listOfChanges
+                
+                result = toString $ encode funChanges
+            
+            -- Write original results file (unchanged)
             listOfChanges <- mapM (\((moduleName, mPreviousAST), (_, mCurrentAST)) -> do
                                     let currentFunctions = maybe [] getAllFunctions mCurrentAST
                                         previousFunctions = maybe [] getAllFunctions mPreviousAST
@@ -238,11 +402,30 @@ run = do
             getGranularChangeForFunctions (map ((\(moduleName, currentFns, previousFns, _, _, _, _) -> (moduleName,currentFns,previousFns) )) listOfChanges)
             
             print "Processing complete. Check output files for details."
+            
+            -- Process detailed changes for all declaration types
+            let detailedChanges = map (\(moduleName, currentFns, previousFns, currentTypes, previousTypes, currentInsts, previousInsts) -> 
+                                    let addedFns = HM.keys $ HM.difference currentFns previousFns
+                                        addedTypes = HM.keys $ HM.difference currentTypes previousTypes
+                                        addedInsts = HM.keys $ HM.difference currentInsts previousInsts
+                                    in getAllChangesWithCode 
+                                        currentFns previousFns addedFns
+                                        currentTypes previousTypes addedTypes
+                                        currentInsts previousInsts addedInsts
+                                        moduleName) 
+                                 listOfChanges
+            
+            -- Create code files with detailed changes
+            createCodeFiles detailedChanges
+            getGranularChangeForFunctions (map ((\(moduleName, currentFns, previousFns, _, _, _, _) -> (moduleName,currentFns,previousFns) )) listOfChanges)
+            
+            print "Processing complete. Check output files for details."
             pure ()
         _ -> fail $ "can't proceed please pass all the arguments in the order of repoUrl localPath oldCommit newCommit but got: " <> show x
     where
         mkAst :: [(String, String)] -> FilePath -> IO [(String, (Maybe (Ann AST.UModule (Dom GhcPs) SrcTemplateStage)))]
         mkAst modifiedModsAndPaths localRepoPath =
+            mapM (\(m, p) -> mkModuleNameAndAstTuple m p localRepoPath) modifiedModsAndPaths
             mapM (\(m, p) -> mkModuleNameAndAstTuple m p localRepoPath) modifiedModsAndPaths
 
         mkModuleNameAndAstTuple :: String -> String -> FilePath -> IO (String, (Maybe (Ann AST.UModule (Dom GhcPs) SrcTemplateStage)))
@@ -259,8 +442,15 @@ run = do
                 Left err  -> do
                     print ("Error Parsing module. Error is " <> show err)
                     appendFile "error.log" (show err <> " " <> show (localRepoPath <> path) <> " " <> moduleName <> "\n")
+                    appendFile "error.log" (show err <> " " <> show (localRepoPath <> path) <> " " <> moduleName <> "\n")
                     pure Nothing
 
+        getFunctionModifiedSimple :: (HM.HashMap String (Ann AST.UDecl (Dom GhcPs) SrcTemplateStage)) 
+                                -> (HM.HashMap String (Ann AST.UDecl (Dom GhcPs) SrcTemplateStage)) 
+                                -> [String] 
+                                -> String 
+                                -> FunctionModified
+        getFunctionModifiedSimple newFuns oldFuns removed moduleName = do
         getFunctionModifiedSimple :: (HM.HashMap String (Ann AST.UDecl (Dom GhcPs) SrcTemplateStage)) 
                                 -> (HM.HashMap String (Ann AST.UDecl (Dom GhcPs) SrcTemplateStage)) 
                                 -> [String] 
