@@ -33,7 +33,7 @@ library
         regex-posix, 
         unordered-containers, 
         text, 
-        deriving-compat, 
+        -- deriving-compat, 
         regex-compat, 
         aeson, 
         utf8-string, 
@@ -55,7 +55,7 @@ executable cada
         process,
         directory,
         cada, 
-        deriving-compat,
+        -- deriving-compat,
         aeson-pretty,
     hs-source-dirs:   app
     default-language: Haskell2010

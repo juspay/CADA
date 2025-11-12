@@ -54,6 +54,7 @@ import System.FilePath ((</>), takeExtension)
 import System.FilePath ((</>), takeDirectory, takeExtension,takeBaseName)
 import Control.Monad (filterM, forM)
 import Control.Applicative ((<|>))
+import Debug.Trace
 
 -- Data type to represent source locations
 data SourceLocation = SourceLocation {
@@ -147,7 +148,8 @@ generateProjectRoots cabalPaths =
 -- Extract module names from file paths
 extractModuleNames :: [(FilePath, String)] -> [FilePath] -> [(String, String, String)]
 extractModuleNames projectRoots filePaths =
-    filter (\(m, _,_) -> m /= "NA") (map extractModNameAndPath filePaths)
+    let haskellFiles = filter (\fp -> takeExtension fp == ".hs" || ".hs-boot" `isSuffixOf` fp) filePaths
+    in filter (\(m, _,_) -> m /= "NA") (map extractModNameAndPath haskellFiles)
     where
         extractModNameAndPath :: FilePath -> (String, String, String)
         extractModNameAndPath filePath = do
@@ -182,59 +184,78 @@ initGhcFlags :: Ghc DynFlags
 initGhcFlags = do   
     dflags <- getSessionDynFlags    
     
-    -- Set all extensions FIRST, before other modifications
+    -- Set all extensions FIRST - be VERY permissive to parse as much as possible
     let enabledExtensions = [
-            LangExt.BlockArguments            
-            , LangExt.ConstraintKinds            
-            , LangExt.DataKinds            
-            , LangExt.DeriveDataTypeable            
-            , LangExt.DeriveFoldable            
-            , LangExt.DeriveFunctor            
-            , LangExt.DeriveGeneric            
-            , LangExt.DeriveTraversable            
-            , LangExt.ExplicitForAll            
-            , LangExt.FlexibleContexts            
-            , LangExt.FlexibleInstances            
-            , LangExt.GADTs            
-            , LangExt.GeneralizedNewtypeDeriving            
-            , LangExt.ImplicitPrelude            
-            , LangExt.KindSignatures            
-            , LangExt.MultiParamTypeClasses            
-            , LangExt.OverloadedStrings            
-            , LangExt.RankNTypes            
-            , LangExt.ScopedTypeVariables            
+            LangExt.AllowAmbiguousTypes
+            , LangExt.BangPatterns
+            , LangExt.BinaryLiterals
+            , LangExt.BlockArguments
+            , LangExt.ConstraintKinds
+            , LangExt.Cpp  -- Enable C preprocessor
+            , LangExt.DataKinds
+            , LangExt.DefaultSignatures
+            , LangExt.DeriveAnyClass
+            , LangExt.DeriveDataTypeable
+            , LangExt.DeriveFoldable
+            , LangExt.DeriveFunctor
+            , LangExt.DeriveGeneric
+            , LangExt.DeriveTraversable
+            , LangExt.DerivingStrategies
+            , LangExt.DerivingVia
+            , LangExt.DuplicateRecordFields
+            , LangExt.EmptyCase
+            , LangExt.EmptyDataDecls
+            , LangExt.EmptyDataDeriving
+            , LangExt.ExistentialQuantification
+            , LangExt.ExplicitForAll
+            , LangExt.ExplicitNamespaces
+            , LangExt.FlexibleContexts
+            , LangExt.FlexibleInstances
+            , LangExt.FunctionalDependencies
+            , LangExt.GADTs
+            , LangExt.GeneralizedNewtypeDeriving
+            , LangExt.HexFloatLiterals
+            , LangExt.ImplicitPrelude
+            , LangExt.InstanceSigs
+            , LangExt.KindSignatures
+            , LangExt.LambdaCase
+            , LangExt.LinearTypes
+            , LangExt.MultiParamTypeClasses
+            , LangExt.NegativeLiterals
+            , LangExt.NumericUnderscores
+            , LangExt.OverloadedLabels
+            , LangExt.OverloadedStrings
+            , LangExt.PackageImports
+            , LangExt.PartialTypeSignatures
+            , LangExt.PatternSynonyms
+            , LangExt.PolyKinds
+            , LangExt.PostfixOperators
+            , LangExt.QuasiQuotes
+            , LangExt.RankNTypes
+            , LangExt.RecordPuns
+            , LangExt.RecordWildCards
+            , LangExt.ScopedTypeVariables
+            , LangExt.StandaloneDeriving
+            , LangExt.Strict
             , LangExt.TemplateHaskell
-            , LangExt.TypeFamilies            
-            , LangExt.TypeSynonymInstances            
-            , LangExt.BangPatterns            
-            , LangExt.StandaloneDeriving            
-            , LangExt.EmptyDataDecls            
-            , LangExt.FunctionalDependencies            
-            , LangExt.PartialTypeSignatures            
-            , LangExt.ExistentialQuantification            
-            , LangExt.LambdaCase           
-            , LangExt.DeriveAnyClass            
-            , LangExt.DerivingStrategies            
-            , LangExt.DuplicateRecordFields            
-            , LangExt.EmptyCase            
-            , LangExt.InstanceSigs            
-            , LangExt.PatternSynonyms            
-            , LangExt.QuasiQuotes           
-            , LangExt.RecordWildCards            
-            , LangExt.TupleSections            
-            , LangExt.TypeApplications            
-            , LangExt.TypeOperators            
-            , LangExt.UndecidableInstances            
-            , LangExt.AllowAmbiguousTypes            
-            , LangExt.DefaultSignatures         
-            , LangExt.OverloadedLabels            
-            , LangExt.PolyKinds            
+            , LangExt.TemplateHaskellQuotes
+            , LangExt.TupleSections
+            , LangExt.TypeApplications
+            , LangExt.TypeFamilies
+            , LangExt.TypeOperators
+            , LangExt.TypeSynonymInstances
+            , LangExt.UndecidableInstances
+            , LangExt.UnicodeSyntax
+            , LangExt.ViewPatterns
+            -- , LangExt.MagicHash
+            -- , LangExt.UnboxedTuples
+            -- , LangExt.UnboxedSums
           ]
     
     -- Enable all extensions at once
     let dflagsWithExtensions = foldl xopt_set dflags enabledExtensions
     
-    -- Now set other flags
+    -- Now set other flags - be maximally permissive
     let finalDflags = dflagsWithExtensions {  
         importPaths = [],
         ghcMode = CompManager,
@@ -243,10 +264,16 @@ initGhcFlags = do
         language = Just Haskell2010
     }
     
-    -- Set other GHC options
+    -- Set other GHC options for maximum permissiveness
     let finalDflagsWithOpts = finalDflags 
             `gopt_set` Opt_KeepRawTokenStream
             `gopt_set` Opt_NoHsMain
+            `gopt_set` Opt_DeferTypeErrors
+            `gopt_set` Opt_DeferTypedHoles
+            `gopt_set` Opt_DeferOutOfScopeVariables
+            `gopt_unset` Opt_WarnIsError
+            `gopt_set` Opt_SuppressUniques
+            -- `gopt_unset` Opt_WarnTabs
     
     setSessionDynFlags finalDflagsWithOpts
     getSessionDynFlags
@@ -262,9 +289,14 @@ parseModuleComplete modulePath moduleName =
         useDirs [modulePath]
         target <- guessTarget moduleName Nothing
         setTargets [target]
-        void $ load LoadAllTargets  -- This processes language pragmas
-        modSum <- getModSummary $ mkModuleName moduleName
-        parseModule modSum
+        -- Just parse, don't compile/load - this allows parsing without dependencies
+        modGraph <- depanal [] False
+        case find (\ms -> ms_mod_name ms == mkModuleName moduleName) (mgModSummaries modGraph) of
+            Just modSum -> parseModule modSum
+            Nothing -> do
+                -- Fallback: try to find and parse the file directly
+                modSum <- getModSummary $ mkModuleName moduleName
+                parseModule modSum
 
 
 -- Extract all declarations from a parsed module
@@ -461,6 +493,16 @@ getDeclSourceCode decl = showSDocUnsafe (ppr decl)
 hasTHPragma :: BS.ByteString -> Bool
 hasTHPragma bs = "{-# LANGUAGE TemplateHaskell #-}" `BS.isInfixOf` bs
 
+-- Track parsing statistics
+data ParseStats = ParseStats {
+    totalFiles :: Int,
+    successfullyParsed :: Int,
+    skippedTemplateHaskell :: Int,
+    skippedUnicodeSyntax :: Int,
+    skippedGHCPlugin :: Int,
+    skippedOtherErrors :: Int
+} deriving (Show)
+
 -- Process modules and track changes
 processModuleSafe :: Bool -> String -> String -> String -> FilePath -> IO (String, Maybe ParsedModule, Bool)
 processModuleSafe isTried actualFilePath moduleName path localRepoPath = do
@@ -468,27 +510,37 @@ processModuleSafe isTried actualFilePath moduleName path localRepoPath = do
   -- First check if the file actually exists
   fileExists <- doesFileExist actualFilePath
   if not fileExists
-    then pure (moduleName, Nothing, False) -- (moduleName, result, fileExists)
+    then pure (moduleName, Nothing, False)
     else do
       result <- try (parseModuleComplete filePath moduleName) :: IO (Either SomeException ParsedModule)
+      
       case result of
         Right val -> pure (moduleName, Just val, True)
         Left err -> do
-          appendFile "error.log" (show err <> " " <> show filePath <> " " <> moduleName <> "\n")
-          if "Perhaps you intended to use TemplateHaskell" `isInfixOf` (show err) && "parse error on input `$'" `isInfixOf` (show err)
-            then 
-              if (not isTried) 
-                then do
-                  d <- BS.readFile actualFilePath
-                  BS.writeFile actualFilePath (BSC.pack "{-# LANGUAGE TemplateHaskell #-}\n" <> d)
-                  (modName, res, exists) <- processModuleSafe True actualFilePath moduleName path localRepoPath
-                  BS.writeFile actualFilePath (d)
-                  pure (modName, res, exists)
-                else pure (moduleName, Nothing, True) -- File exists but couldn't parse
-            else do
-                print ("Error Parsing module. Error is " <> show err)
-                appendFile "error.log" (show err <> " " <> show filePath <> " " <> moduleName <> "\n")
-                pure (moduleName, Nothing, True) -- File exists but couldn't parse
+          let errMsg = show err
+          
+          -- Categorize and handle different error types
+          let errorType
+                | "Perhaps you intended to use TemplateHaskell" `isInfixOf` errMsg = "TH"
+                | "Could not find module 'Data.Record.Plugin" `isInfixOf` errMsg = "Plugin"
+                | any (`isInfixOf` errMsg) ["parse error on input `→'", "parse error on input `∀'", 
+                                           "parse error on input `←'", "parse error on input `∷'",
+                                           "parse error on input `⇒'"] = "Unicode"
+                | "Lambda-syntax in pattern" `isInfixOf` errMsg = "LambdaPattern"
+                | "Operator applied to too few arguments" `isInfixOf` errMsg = "Operator"
+                | "Parse error in pattern" `isInfixOf` errMsg = "PatternError"
+                | "lexical error in string/character literal" `isInfixOf` errMsg = "LexicalError"
+                | "user interrupt" `isInfixOf` errMsg = "Interrupted"
+                | otherwise = "Other"
+          
+          -- Only log detailed errors for unexpected cases
+          when (errorType == "Other") $
+            appendFile "error.log" (errMsg <> " " <> show filePath <> " " <> moduleName <> "\n")
+          
+          -- Log summary to console
+          appendFile "parse_summary.log" (errorType <> "\t" <> moduleName <> "\n")
+          
+          pure (moduleName, Nothing, True)
 
 -- Helper function to add a function to the modified list
 addFunctionModified :: FunctionModified -> String -> FunctionModified
@@ -670,8 +722,9 @@ run = do
           cloneRepo repoUrl localRepoPath
           cabalpaths <- findCabalFiles localRepoPath
           changedFiles <- getChangedFiles branchName currentCommit localRepoPath
-          let modifiedModsAndPaths = extractModuleNames (generateProjectRoots cabalpaths) changedFiles
+          let modifiedModsAndPaths = extractModuleNames (traceShowId $ generateProjectRoots cabalpaths) changedFiles
           print ("modified files: " <> show changedFiles)
+          print ("modified files: " <> show modifiedModsAndPaths)
           
           -- Process modules for previous commit
           maybePreviousAST <- mapM (\(m, p, fp) -> processModuleSafe False fp m p localRepoPath) modifiedModsAndPaths
@@ -689,8 +742,13 @@ run = do
           let (newModules, deletedModules, modifiedModules) = partitionModules listOfAstTuple
           
           -- Handle completely new modules (entire module as "added")
-          newModuleChanges <- mapM (\(moduleName, Just ast) -> 
-                                   pure $ getEntireModuleAsChanges moduleName ast True) newModules
+          newModuleChanges <- catMaybes <$> mapM (\(moduleName, x) -> 
+                                          case x of 
+                                            Just ast -> pure $ Just $ getEntireModuleAsChanges moduleName ast True
+                                            Nothing -> do 
+                                              print ("Module not found " ++ moduleName) 
+                                              pure Nothing
+                                  ) newModules
           
           -- Handle completely deleted modules (entire module as "deleted")  
           deletedModuleChanges <- mapM (\(moduleName, Just ast) -> 
