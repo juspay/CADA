@@ -3,10 +3,12 @@
 
 module Diff where
 
+import qualified GHC.Data.EnumSet as EnumSet
 import Control.Exception
 import Control.Monad
 import qualified Data.HashMap.Strict as HM
-import Data.Maybe (catMaybes,mapMaybe,fromMaybe)
+import Data.Maybe (catMaybes,mapMaybe,fromMaybe,isNothing)
+import Text.Read (readMaybe)
 import Data.List
 import qualified Data.Text as T
 import Data.Text (Text)
@@ -26,7 +28,7 @@ import qualified GHC.Driver.Session as GHC
 import GHC.Utils.Outputable hiding ((<>))
 import GHC.Driver.Flags
 import GHC.Driver.Session
-import GHC.LanguageExtensions.Type
+import GHC.LanguageExtensions.Type hiding (Extension)
 import System.Environment( getArgs )
 import GHC.Types.Name
 import GHC.Core.TyCo.Rep
@@ -55,6 +57,27 @@ import System.FilePath ((</>), takeDirectory, takeExtension,takeBaseName)
 import Control.Monad (filterM, forM)
 import Control.Applicative ((<|>))
 import Debug.Trace
+import Control.Concurrent.Async (mapConcurrently)
+
+-- Cabal imports for parsing .cabal files
+import Distribution.PackageDescription hiding (Extension)
+import Distribution.PackageDescription.Parsec
+import Distribution.Types.GenericPackageDescription
+import Distribution.Types.BuildInfo
+import Distribution.Types.Library
+import Distribution.Types.CondTree
+import Distribution.ModuleName (ModuleName)
+import qualified Distribution.ModuleName as ModuleName
+import Language.Haskell.Extension (Extension(..), KnownExtension)
+import qualified Language.Haskell.Extension as Ext
+import Distribution.Verbosity (normal)
+import Distribution.Utils.Path (getSymbolicPath)
+import qualified GHC.LanguageExtensions as LangExt
+import qualified Language.Haskell.Extension as Cabal
+import qualified Control.Monad.Catch as MC
+import GHC.Driver.Pipeline.Monad
+import GHC.Parser.Header (getOptionsFromFile)
+import GHC.Driver.Session (parseDynamicFilePragma)
 
 -- Data type to represent source locations
 data SourceLocation = SourceLocation {
@@ -131,10 +154,20 @@ findCabalFiles :: FilePath -> IO [FilePath]
 findCabalFiles dir = do
     contents <- listDirectory dir
     let paths = map (dir </>) contents
+
+    -- Find subdirectories for recursion
     dirs <- filterM doesDirectoryExist paths
-    files <- filterM (\p -> return (takeExtension p == ".cabal")) paths
+
+    -- Find .cabal files in current directory (check both extension AND that it's a file)
+    cabalFiles <- filterM (\p -> do
+        isFile <- doesFileExist p
+        return (isFile && takeExtension p == ".cabal")
+        ) paths
+
+    -- Recursively search subdirectories
     nested <- concat <$> mapM findCabalFiles dirs
-    return (files ++ nested)
+
+    return (cabalFiles ++ nested)
 
 generateProjectRoots :: [FilePath] -> [(FilePath, String)]
 generateProjectRoots cabalPaths =
@@ -144,6 +177,371 @@ generateProjectRoots cabalPaths =
     dropPrefix p = case stripPrefix "./" p of
         Just rest -> rest
         Nothing -> p
+
+-- Data structure to hold parsed Cabal configuration
+data CabalConfig = CabalConfig {
+    cabalSourceDirs :: [FilePath],
+    cabalExtensions :: [Extension],
+    cabalDependencies :: [String],
+    cabalPackageName :: String,
+    cabalBasePath :: FilePath,
+    cabalDefaultLanguage :: Maybe Cabal.Language
+} deriving (Show)
+
+-- Parse a single .cabal file and extract configuration for ALL components
+parseCabalFile :: FilePath -> IO [CabalConfig]
+parseCabalFile cabalPath = do
+    exists <- doesFileExist cabalPath
+    if not exists
+        then pure []
+        else do
+            result <- readGenericPackageDescription normal cabalPath
+            let basePath = takeDirectory cabalPath
+                pkgDesc = packageDescription result
+                pkgNameStr = unPackageName . pkgName . package $ pkgDesc
+                
+                -- Extract from main library component if it exists
+                mainLibConfigs = case condLibrary result of
+                    Nothing -> []
+                    Just condTree -> 
+                        let lib = condTreeData condTree
+                            libBI = libBuildInfo lib
+                            rawSrcDirs = hsSourceDirs libBI
+                            srcDirs = map ((basePath </>) . getSymbolicPath) rawSrcDirs
+                            finalSrcDirs = if null srcDirs then [basePath] else srcDirs
+                            exts = defaultExtensions libBI
+                            deps = map (unPackageName . depPkgName) $ targetBuildDepends libBI
+                            defaultLang = defaultLanguage libBI
+                        in [CabalConfig {
+                            cabalSourceDirs = finalSrcDirs,
+                            cabalExtensions = exts,
+                            cabalDependencies = deps,
+                            cabalPackageName = pkgNameStr,
+                            cabalBasePath = basePath,
+                            cabalDefaultLanguage = defaultLang
+                        }]
+                
+                -- Extract from ALL named sub-libraries
+                subLibConfigs = map (\(libName, condTree) ->
+                        let lib = condTreeData condTree
+                            libBI = libBuildInfo lib
+                            rawSrcDirs = hsSourceDirs libBI
+                            srcDirs = map ((basePath </>) . getSymbolicPath) rawSrcDirs
+                            finalSrcDirs = if null srcDirs then [basePath] else srcDirs
+                            exts = defaultExtensions libBI
+                            deps = map (unPackageName . depPkgName) $ targetBuildDepends libBI
+                            defaultLang = defaultLanguage libBI
+                        in CabalConfig {
+                            cabalSourceDirs = finalSrcDirs,
+                            cabalExtensions = exts,
+                            cabalDependencies = deps,
+                            cabalPackageName = unUnqualComponentName libName,
+                            cabalBasePath = basePath,
+                            cabalDefaultLanguage = defaultLang
+                        }) (condSubLibraries result)
+                
+                -- Combine main library and sub-libraries
+                libConfigs = mainLibConfigs ++ subLibConfigs
+                
+                -- Extract from ALL executables
+                exeConfigs = map (\(exeName, condTree) ->
+                        let exe = condTreeData condTree
+                            exeBI = buildInfo exe
+                            srcDirs = map ((basePath </>) . getSymbolicPath) $ hsSourceDirs exeBI
+                            exts = defaultExtensions exeBI
+                            deps = map (unPackageName . depPkgName) $ targetBuildDepends exeBI
+                            defaultLang = defaultLanguage exeBI
+                        in CabalConfig {
+                            cabalSourceDirs = if null srcDirs then [basePath] else srcDirs,
+                            cabalExtensions = exts,
+                            cabalDependencies = deps,
+                            cabalPackageName = pkgNameStr ++ "-" ++ unUnqualComponentName exeName,
+                            cabalBasePath = basePath,
+                            cabalDefaultLanguage = defaultLang
+                        }) (condExecutables result)
+                
+                -- Extract from ALL test suites
+                testConfigs = map (\(testName, condTree) ->
+                        let test = condTreeData condTree
+                            testBI = testBuildInfo test
+                            srcDirs = map ((basePath </>) . getSymbolicPath) $ hsSourceDirs testBI
+                            exts = defaultExtensions testBI
+                            deps = map (unPackageName . depPkgName) $ targetBuildDepends testBI
+                            defaultLang = defaultLanguage testBI
+                        in CabalConfig {
+                            cabalSourceDirs = if null srcDirs then [basePath] else srcDirs,
+                            cabalExtensions = exts,
+                            cabalDependencies = deps,
+                            cabalPackageName = pkgNameStr ++ "-test-" ++ unUnqualComponentName testName,
+                            cabalBasePath = basePath,
+                            cabalDefaultLanguage = defaultLang
+                        }) (condTestSuites result)
+                
+                -- Extract from ALL benchmarks
+                benchConfigs = map (\(benchName, condTree) ->
+                        let bench = condTreeData condTree
+                            benchBI = benchmarkBuildInfo bench
+                            srcDirs = map ((basePath </>) . getSymbolicPath) $ hsSourceDirs benchBI
+                            exts = defaultExtensions benchBI
+                            deps = map (unPackageName . depPkgName) $ targetBuildDepends benchBI
+                            defaultLang = defaultLanguage benchBI
+                        in CabalConfig {
+                            cabalSourceDirs = if null srcDirs then [basePath] else srcDirs,
+                            cabalExtensions = exts,
+                            cabalDependencies = deps,
+                            cabalPackageName = pkgNameStr ++ "-bench-" ++ unUnqualComponentName benchName,
+                            cabalBasePath = basePath,
+                            cabalDefaultLanguage = defaultLang
+                        }) (condBenchmarks result)
+            
+            let allConfigs = libConfigs ++ exeConfigs ++ testConfigs ++ benchConfigs
+            -- Debug: print what we parsed
+            mapM_ (\cfg -> putStrLn $ "  Parsed component: " ++ cabalPackageName cfg ++ 
+                                     " with src dirs: " ++ show (cabalSourceDirs cfg)) allConfigs
+            -- Return all configs (library + all executables)
+            pure allConfigs
+
+-- Parse all .cabal files in the repository
+parseAllCabalFiles :: [FilePath] -> IO [CabalConfig]
+parseAllCabalFiles cabalPaths = do
+    configs <- mapM parseCabalFile cabalPaths
+    pure $ concat configs
+
+-- | Convert a Cabal Extension to a GHC Language Extension
+cabalExtToGhcExt :: Cabal.Extension -> (Maybe LangExt.Extension,Bool)
+cabalExtToGhcExt (Cabal.EnableExtension ext)  = (cabalKnownExtToGhcExt ext , True)
+cabalExtToGhcExt (Cabal.DisableExtension ext)   = (cabalKnownExtToGhcExt  ext, False) -- DisableExtension doesn't map directly
+cabalExtToGhcExt (Cabal.UnknownExtension _)   = (Nothing,False)  -- Unknown extensions can't be mapped
+
+-- | Map Cabal's KnownExtension to GHC's Extension
+cabalKnownExtToGhcExt :: Cabal.KnownExtension -> Maybe LangExt.Extension
+cabalKnownExtToGhcExt ext = case ext of
+  Cabal.OverlappingInstances          -> Just LangExt.OverlappingInstances
+  Cabal.UndecidableInstances          -> Just LangExt.UndecidableInstances
+  Cabal.IncoherentInstances           -> Just LangExt.IncoherentInstances
+  Cabal.DoRec                         -> Just LangExt.RecursiveDo
+  Cabal.RecursiveDo                   -> Just LangExt.RecursiveDo
+  Cabal.ParallelListComp              -> Just LangExt.ParallelListComp
+  Cabal.MultiParamTypeClasses         -> Just LangExt.MultiParamTypeClasses
+  Cabal.MonomorphismRestriction       -> Just LangExt.MonomorphismRestriction
+  Cabal.FunctionalDependencies        -> Just LangExt.FunctionalDependencies
+  Cabal.Rank2Types                    -> Just LangExt.RankNTypes
+  Cabal.RankNTypes                    -> Just LangExt.RankNTypes
+  Cabal.PolymorphicComponents         -> Just LangExt.RankNTypes
+  Cabal.ExistentialQuantification     -> Just LangExt.ExistentialQuantification
+  Cabal.ScopedTypeVariables           -> Just LangExt.ScopedTypeVariables
+  Cabal.PatternSignatures             -> Just LangExt.ScopedTypeVariables
+  Cabal.ImplicitParams                -> Just LangExt.ImplicitParams
+  Cabal.FlexibleContexts              -> Just LangExt.FlexibleContexts
+  Cabal.FlexibleInstances             -> Just LangExt.FlexibleInstances
+  Cabal.EmptyDataDecls                -> Just LangExt.EmptyDataDecls
+  Cabal.CPP                           -> Just LangExt.Cpp
+  Cabal.KindSignatures                -> Just LangExt.KindSignatures
+  Cabal.BangPatterns                  -> Just LangExt.BangPatterns
+  Cabal.TypeSynonymInstances          -> Just LangExt.TypeSynonymInstances
+  Cabal.TemplateHaskell               -> Just LangExt.TemplateHaskell
+  Cabal.ForeignFunctionInterface      -> Just LangExt.ForeignFunctionInterface
+  Cabal.Arrows                        -> Just LangExt.Arrows
+  Cabal.Generics                      -> Nothing  -- Deprecated, no direct mapping
+  Cabal.ImplicitPrelude               -> Just LangExt.ImplicitPrelude
+  Cabal.NamedFieldPuns                -> Just LangExt.RecordPuns
+  Cabal.PatternGuards                 -> Just LangExt.PatternGuards
+  Cabal.GeneralizedNewtypeDeriving    -> Just LangExt.GeneralizedNewtypeDeriving
+  Cabal.GeneralisedNewtypeDeriving    -> Just LangExt.GeneralizedNewtypeDeriving
+  Cabal.ExtensibleRecords             -> Nothing  -- Hugs-specific
+  Cabal.RestrictedTypeSynonyms        -> Nothing  -- Hugs-specific
+  Cabal.HereDocuments                 -> Nothing  -- Hugs-specific
+  Cabal.MagicHash                     -> Just LangExt.MagicHash
+  Cabal.TypeFamilies                  -> Just LangExt.TypeFamilies
+  Cabal.StandaloneDeriving            -> Just LangExt.StandaloneDeriving
+  Cabal.UnicodeSyntax                 -> Just LangExt.UnicodeSyntax
+  Cabal.UnliftedFFITypes              -> Just LangExt.UnliftedFFITypes
+  Cabal.InterruptibleFFI              -> Just LangExt.InterruptibleFFI
+  Cabal.CApiFFI                       -> Just LangExt.CApiFFI
+  Cabal.LiberalTypeSynonyms           -> Just LangExt.LiberalTypeSynonyms
+  Cabal.TypeOperators                 -> Just LangExt.TypeOperators
+  Cabal.RecordWildCards               -> Just LangExt.RecordWildCards
+  Cabal.RecordPuns                    -> Just LangExt.RecordPuns
+  Cabal.DisambiguateRecordFields      -> Just LangExt.DisambiguateRecordFields
+  Cabal.TraditionalRecordSyntax       -> Just LangExt.TraditionalRecordSyntax
+  Cabal.OverloadedStrings             -> Just LangExt.OverloadedStrings
+  Cabal.GADTs                         -> Just LangExt.GADTs
+  Cabal.GADTSyntax                    -> Just LangExt.GADTSyntax
+  Cabal.MonoPatBinds                  -> Nothing  -- Deprecated
+  Cabal.RelaxedPolyRec                -> Just LangExt.RelaxedPolyRec
+  Cabal.ExtendedDefaultRules          -> Just LangExt.ExtendedDefaultRules
+  Cabal.UnboxedTuples                 -> Just LangExt.UnboxedTuples
+  Cabal.DeriveDataTypeable            -> Just LangExt.DeriveDataTypeable
+  Cabal.DeriveGeneric                 -> Just LangExt.DeriveGeneric
+  Cabal.DefaultSignatures             -> Just LangExt.DefaultSignatures
+  Cabal.InstanceSigs                  -> Just LangExt.InstanceSigs
+  Cabal.ConstrainedClassMethods       -> Just LangExt.ConstrainedClassMethods
+  Cabal.PackageImports                -> Just LangExt.PackageImports
+  Cabal.ImpredicativeTypes            -> Just LangExt.ImpredicativeTypes
+  Cabal.NewQualifiedOperators         -> Nothing  -- Deprecated
+  Cabal.PostfixOperators              -> Just LangExt.PostfixOperators
+  Cabal.QuasiQuotes                   -> Just LangExt.QuasiQuotes
+  Cabal.TransformListComp             -> Just LangExt.TransformListComp
+  Cabal.MonadComprehensions           -> Just LangExt.MonadComprehensions
+  Cabal.ViewPatterns                  -> Just LangExt.ViewPatterns
+  Cabal.XmlSyntax                     -> Nothing  -- HSP-specific
+  Cabal.RegularPatterns               -> Nothing  -- Not in GHC
+  Cabal.TupleSections                 -> Just LangExt.TupleSections
+  Cabal.GHCForeignImportPrim          -> Just LangExt.GHCForeignImportPrim
+  Cabal.NPlusKPatterns                -> Just LangExt.NPlusKPatterns
+  Cabal.DoAndIfThenElse               -> Just LangExt.DoAndIfThenElse
+  Cabal.MultiWayIf                    -> Just LangExt.MultiWayIf
+  Cabal.LambdaCase                    -> Just LangExt.LambdaCase
+  Cabal.RebindableSyntax              -> Just LangExt.RebindableSyntax
+  Cabal.ExplicitForAll                -> Just LangExt.ExplicitForAll
+  Cabal.DatatypeContexts              -> Just LangExt.DatatypeContexts
+  Cabal.MonoLocalBinds                -> Just LangExt.MonoLocalBinds
+  Cabal.DeriveFunctor                 -> Just LangExt.DeriveFunctor
+  Cabal.DeriveTraversable             -> Just LangExt.DeriveTraversable
+  Cabal.DeriveFoldable                -> Just LangExt.DeriveFoldable
+  Cabal.NondecreasingIndentation      -> Just LangExt.NondecreasingIndentation
+  Cabal.SafeImports                   -> Nothing  -- Part of Safe Haskell, handled differently
+  Cabal.Safe                          -> Nothing  -- Safe Haskell mode, not an extension flag
+  Cabal.Trustworthy                   -> Nothing  -- Safe Haskell mode, not an extension flag
+  Cabal.Unsafe                        -> Nothing  -- Safe Haskell mode, not an extension flag
+  Cabal.ConstraintKinds               -> Just LangExt.ConstraintKinds
+  Cabal.PolyKinds                     -> Just LangExt.PolyKinds
+  Cabal.DataKinds                     -> Just LangExt.DataKinds
+  Cabal.ParallelArrays                -> Just LangExt.ParallelArrays
+  Cabal.RoleAnnotations               -> Just LangExt.RoleAnnotations
+  Cabal.OverloadedLists               -> Just LangExt.OverloadedLists
+  Cabal.EmptyCase                     -> Just LangExt.EmptyCase
+  Cabal.AutoDeriveTypeable            -> Nothing  -- Deprecated, automatic in modern GHC
+  Cabal.NegativeLiterals              -> Just LangExt.NegativeLiterals
+  Cabal.BinaryLiterals                -> Just LangExt.BinaryLiterals
+  Cabal.NumDecimals                   -> Just LangExt.NumDecimals
+  Cabal.NullaryTypeClasses            -> Nothing  -- Deprecated, use MultiParamTypeClasses
+  Cabal.ExplicitNamespaces            -> Just LangExt.ExplicitNamespaces
+  Cabal.AllowAmbiguousTypes           -> Just LangExt.AllowAmbiguousTypes
+  Cabal.JavaScriptFFI                 -> Just LangExt.JavaScriptFFI
+  Cabal.PatternSynonyms               -> Just LangExt.PatternSynonyms
+  Cabal.PartialTypeSignatures         -> Just LangExt.PartialTypeSignatures
+  Cabal.NamedWildCards                -> Just LangExt.NamedWildCards
+  Cabal.DeriveAnyClass                -> Just LangExt.DeriveAnyClass
+  Cabal.DeriveLift                    -> Just LangExt.DeriveLift
+  Cabal.StaticPointers                -> Just LangExt.StaticPointers
+  Cabal.StrictData                    -> Just LangExt.StrictData
+  Cabal.Strict                        -> Just LangExt.Strict
+  Cabal.ApplicativeDo                 -> Just LangExt.ApplicativeDo
+  Cabal.DuplicateRecordFields         -> Just LangExt.DuplicateRecordFields
+  Cabal.TypeApplications              -> Just LangExt.TypeApplications
+  Cabal.TypeInType                    -> Just LangExt.TypeInType
+  Cabal.UndecidableSuperClasses       -> Just LangExt.UndecidableSuperClasses
+  Cabal.MonadFailDesugaring           -> Nothing  -- Transitional, no longer needed
+  Cabal.TemplateHaskellQuotes         -> Just LangExt.TemplateHaskellQuotes
+  Cabal.OverloadedLabels              -> Just LangExt.OverloadedLabels
+  Cabal.TypeFamilyDependencies        -> Just LangExt.TypeFamilyDependencies
+  Cabal.DerivingStrategies            -> Just LangExt.DerivingStrategies
+  Cabal.DerivingVia                   -> Just LangExt.DerivingVia
+  Cabal.UnboxedSums                   -> Just LangExt.UnboxedSums
+  Cabal.HexFloatLiterals              -> Just LangExt.HexFloatLiterals
+  Cabal.BlockArguments                -> Just LangExt.BlockArguments
+  Cabal.NumericUnderscores            -> Just LangExt.NumericUnderscores
+  Cabal.QuantifiedConstraints         -> Just LangExt.QuantifiedConstraints
+  Cabal.StarIsType                    -> Just LangExt.StarIsType
+  Cabal.EmptyDataDeriving             -> Just LangExt.EmptyDataDeriving
+  Cabal.CUSKs                         -> Just LangExt.CUSKs
+  Cabal.ImportQualifiedPost           -> Just LangExt.ImportQualifiedPost
+  Cabal.StandaloneKindSignatures      -> Just LangExt.StandaloneKindSignatures
+  Cabal.UnliftedNewtypes              -> Just LangExt.UnliftedNewtypes
+  Cabal.LexicalNegation               -> Just LangExt.LexicalNegation
+  Cabal.QualifiedDo                   -> Just LangExt.QualifiedDo
+  Cabal.LinearTypes                   -> Just LangExt.LinearTypes
+  Cabal.FieldSelectors                -> Just LangExt.FieldSelectors
+  Cabal.OverloadedRecordDot           -> Just LangExt.OverloadedRecordDot
+  Cabal.UnliftedDatatypes             -> Just LangExt.UnliftedDatatypes
+
+
+-- Find which cabal config a file belongs to based on file path
+findCabalForFile :: FilePath -> [CabalConfig] -> Maybe CabalConfig
+findCabalForFile filePath cabalConfigs =
+    -- Normalize the file path by removing leading "./" if present
+    let normalizedFilePath = case stripPrefix "./" filePath of
+                                Just p -> p
+                                Nothing -> filePath
+        
+        matchesCabal cfg = 
+            let basePath = case stripPrefix "./" (cabalBasePath cfg) of
+                            Just p -> p
+                            Nothing -> cabalBasePath cfg
+                -- Check multiple matching strategies:
+                -- 1. basePath is a prefix of the file path
+                -- 2. Any source directory is a prefix of the file path  
+                -- 3. The file path contains the basePath somewhere in it
+            in basePath `isPrefixOf` normalizedFilePath ||
+               any (\srcDir -> 
+                    let normalizedSrcDir = case stripPrefix "./" srcDir of
+                                            Just p -> p
+                                            Nothing -> srcDir
+                    in normalizedSrcDir `isPrefixOf` normalizedFilePath
+                   ) (cabalSourceDirs cfg) ||
+               -- Also check if basePath is contained in the file path (for nested projects)
+               ("/" ++ basePath ++ "/") `isInfixOf` ("/" ++ normalizedFilePath)
+               
+    in find matchesCabal cabalConfigs
+
+-- | Apply all implied extension flags based on currently enabled extensions
+applyImpliedExtensions :: DynFlags -> DynFlags
+applyImpliedExtensions dflags =
+    let enabledExts = EnumSet.toList $ extensionFlags dflags
+        newDflags = foldl' applyImplicationsForExt dflags enabledExts
+    in newDflags
+  where
+    -- Apply implications for a single extension
+    applyImplicationsForExt :: DynFlags -> LangExt.Extension -> DynFlags
+    applyImplicationsForExt df ext =
+        let implications = getImplications ext
+        in foldl' applyImplication df implications
+
+    -- Apply a single implication
+    applyImplication :: DynFlags -> (GHC.Driver.Session.TurnOnFlag, LangExt.Extension) -> DynFlags
+    applyImplication df (turnOnFlag, impliedExt) =
+        case turnOnFlag of
+            True  -> xopt_set df impliedExt
+            False -> xopt_unset df impliedExt
+
+-- | Get all extensions implied by a given extension
+getImplications :: LangExt.Extension -> [(GHC.Driver.Session.TurnOnFlag, LangExt.Extension)]
+getImplications ext =
+    [(onOff, impliedExt) | (triggerExt, onOff, impliedExt) <- GHC.Driver.Session.impliedXFlags, triggerExt == ext]
+
+-- | Apply all implied extensions (GHC handles transitive implications)
+applyImpliedExtensionsComplete :: DynFlags -> DynFlags
+applyImpliedExtensionsComplete = applyImpliedExtensions
+
+-- | Convert Cabal.Language to GHC's Language
+cabalLangToGhcLang :: Cabal.Language -> Language
+cabalLangToGhcLang Cabal.Haskell98 = Haskell98
+cabalLangToGhcLang Cabal.Haskell2010 = Haskell2010
+cabalLangToGhcLang Cabal.GHC2021 = GHC2021
+cabalLangToGhcLang _ = GHC2021  -- Fallback for unknown languages
+
+initGhcFlagsWithCabal :: String -> CabalConfig -> [FilePath] -> Ghc DynFlags
+initGhcFlagsWithCabal actualFilePath cabalConfig extraDirs = do
+    let defaultLang = maybe GHC2021 cabalLangToGhcLang (cabalDefaultLanguage cabalConfig)
+        enabledCabalExts = ((map (\x -> (Just x,True)) $ languageExtensions (Just defaultLang))) <> (map cabalExtToGhcExt $ (cabalExtensions) cabalConfig)
+    dflags''' <- (\x -> foldl' (\acc (mExt,onOrOff) -> 
+                                  case mExt of 
+                                    Just ext -> if onOrOff then xopt_set acc ext else xopt_unset acc ext
+                                    Nothing -> acc) x enabledCabalExts) <$> getSessionDynFlags
+    src_opts <- liftIO $ getOptionsFromFile dflags''' actualFilePath
+    (dflags', leftovers, warns) <- parseDynamicFilePragma dflags''' src_opts
+    _ <- setSessionDynFlags $ applyImpliedExtensionsComplete $ (\x -> 
+                                      x `gopt_set` Opt_KeepRawTokenStream
+                                        `gopt_set` Opt_NoHsMain
+                                        `gopt_set` Opt_DeferTypeErrors
+                                        `gopt_set` Opt_DeferTypedHoles
+                                        `gopt_set` Opt_DeferOutOfScopeVariables
+                                        `gopt_unset` Opt_WarnIsError
+                                        `gopt_set` Opt_SuppressUniques
+                                        `wopt_unset` Opt_WarnTabs
+                                  ) dflags'
+    getSessionDynFlags
 
 -- Extract module names from file paths
 extractModuleNames :: [(FilePath, String)] -> [FilePath] -> [(String, String, String)]
@@ -180,124 +578,31 @@ extractModuleNames projectRoots filePaths =
                                         (_, _, _, [modName]) -> (map (\c -> if c == '/' then '.' else c) modName, newPath ++ "src-extras",filePath)
                                         _                    -> ("NA", "NA",filePath)
 
-initGhcFlags :: Ghc DynFlags 
-initGhcFlags = do   
-    dflags <- getSessionDynFlags    
-    
-    -- Set all extensions FIRST - be VERY permissive to parse as much as possible
-    let enabledExtensions = [
-            LangExt.AllowAmbiguousTypes
-            , LangExt.BangPatterns
-            , LangExt.BinaryLiterals
-            , LangExt.BlockArguments
-            , LangExt.ConstraintKinds
-            , LangExt.Cpp  -- Enable C preprocessor
-            , LangExt.DataKinds
-            , LangExt.DefaultSignatures
-            , LangExt.DeriveAnyClass
-            , LangExt.DeriveDataTypeable
-            , LangExt.DeriveFoldable
-            , LangExt.DeriveFunctor
-            , LangExt.DeriveGeneric
-            , LangExt.DeriveTraversable
-            , LangExt.DerivingStrategies
-            , LangExt.DerivingVia
-            , LangExt.DuplicateRecordFields
-            , LangExt.EmptyCase
-            , LangExt.EmptyDataDecls
-            , LangExt.EmptyDataDeriving
-            , LangExt.ExistentialQuantification
-            , LangExt.ExplicitForAll
-            , LangExt.ExplicitNamespaces
-            , LangExt.FlexibleContexts
-            , LangExt.FlexibleInstances
-            , LangExt.FunctionalDependencies
-            , LangExt.GADTs
-            , LangExt.GeneralizedNewtypeDeriving
-            , LangExt.HexFloatLiterals
-            , LangExt.ImplicitPrelude
-            , LangExt.InstanceSigs
-            , LangExt.KindSignatures
-            , LangExt.LambdaCase
-            , LangExt.LinearTypes
-            , LangExt.MultiParamTypeClasses
-            , LangExt.NegativeLiterals
-            , LangExt.NumericUnderscores
-            , LangExt.OverloadedLabels
-            , LangExt.OverloadedStrings
-            , LangExt.PackageImports
-            , LangExt.PartialTypeSignatures
-            , LangExt.PatternSynonyms
-            , LangExt.PolyKinds
-            , LangExt.PostfixOperators
-            , LangExt.QuasiQuotes
-            , LangExt.RankNTypes
-            , LangExt.RecordPuns
-            , LangExt.RecordWildCards
-            , LangExt.ScopedTypeVariables
-            , LangExt.StandaloneDeriving
-            , LangExt.Strict
-            , LangExt.TemplateHaskell
-            , LangExt.TemplateHaskellQuotes
-            , LangExt.TupleSections
-            , LangExt.TypeApplications
-            , LangExt.TypeFamilies
-            , LangExt.TypeOperators
-            , LangExt.TypeSynonymInstances
-            , LangExt.UndecidableInstances
-            , LangExt.UnicodeSyntax
-            , LangExt.ViewPatterns
-            -- , LangExt.MagicHash
-            -- , LangExt.UnboxedTuples
-            -- , LangExt.UnboxedSums
-          ]
-    
-    -- Enable all extensions at once
-    let dflagsWithExtensions = foldl xopt_set dflags enabledExtensions
-    
-    -- Now set other flags - be maximally permissive
-    let finalDflags = dflagsWithExtensions {  
-        importPaths = [],
-        ghcMode = CompManager,
-        backend = Interpreter,
-        ghcLink = LinkInMemory,
-        language = Just Haskell2010
-    }
-    
-    -- Set other GHC options for maximum permissiveness
-    let finalDflagsWithOpts = finalDflags 
-            `gopt_set` Opt_KeepRawTokenStream
-            `gopt_set` Opt_NoHsMain
-            `gopt_set` Opt_DeferTypeErrors
-            `gopt_set` Opt_DeferTypedHoles
-            `gopt_set` Opt_DeferOutOfScopeVariables
-            `gopt_unset` Opt_WarnIsError
-            `gopt_set` Opt_SuppressUniques
-            -- `gopt_unset` Opt_WarnTabs
-    
-    setSessionDynFlags finalDflagsWithOpts
-    getSessionDynFlags
-
 useDirs :: [FilePath] -> Ghc ()
 useDirs workingDirs = do
   dynflags <- getSessionDynFlags
   void $ setSessionDynFlags dynflags { importPaths = importPaths dynflags ++ workingDirs }
 
-parseModuleComplete modulePath moduleName = 
-    runGhc (Just libdir) $ do
-        initGhcFlags
-        useDirs [modulePath]
+-- Parse module with Cabal configuration (preferred)
+parseModuleWithCabal :: String -> CabalConfig -> FilePath -> String -> Ghc ParsedModule
+parseModuleWithCabal actualFilePath cabalConfig modulePath moduleName = do
+    useDirs [modulePath]
+    dflags <- initGhcFlagsWithCabal actualFilePath cabalConfig [modulePath]
+    eRes <- MC.try $ do
         target <- guessTarget moduleName Nothing
         setTargets [target]
-        -- Just parse, don't compile/load - this allows parsing without dependencies
+        -- loadStatus <- load LoadAllTargets
         modGraph <- depanal [] False
         case find (\ms -> ms_mod_name ms == mkModuleName moduleName) (mgModSummaries modGraph) of
             Just modSum -> parseModule modSum
             Nothing -> do
-                -- Fallback: try to find and parse the file directly
                 modSum <- getModSummary $ mkModuleName moduleName
                 parseModule modSum
-
+    case eRes of
+      Left (err :: SomeException) -> do 
+        liftIO $ print err
+        throw err
+      Right val -> pure val
 
 -- Extract all declarations from a parsed module
 getAllDecls :: ParsedModule -> [LHsDecl GhcPs]
@@ -490,9 +795,6 @@ compareCalledFunctions oldl newl oldDecl newDecl =
 getDeclSourceCode :: (Outputable a) => a -> String
 getDeclSourceCode decl = showSDocUnsafe (ppr decl)
 
-hasTHPragma :: BS.ByteString -> Bool
-hasTHPragma bs = "{-# LANGUAGE TemplateHaskell #-}" `BS.isInfixOf` bs
-
 -- Track parsing statistics
 data ParseStats = ParseStats {
     totalFiles :: Int,
@@ -503,16 +805,31 @@ data ParseStats = ParseStats {
     skippedOtherErrors :: Int
 } deriving (Show)
 
--- Process modules and track changes
-processModuleSafe :: Bool -> String -> String -> String -> FilePath -> IO (String, Maybe ParsedModule, Bool)
-processModuleSafe isTried actualFilePath moduleName path localRepoPath = do
+data SomeCompilerException = SomeCompilerException Text
+
+instance Show SomeCompilerException where
+    show (SomeCompilerException e) = show e
+
+instance Exception SomeCompilerException
+
+-- Process modules and track changes with Cabal configuration
+processModuleSafe :: [CabalConfig] -> Bool -> String -> String -> String -> FilePath -> IO (String, Maybe ParsedModule, Bool)
+processModuleSafe cabalConfigs isTried actualFilePath moduleName path localRepoPath = do
   let filePath = localRepoPath <> path
   -- First check if the file actually exists
   fileExists <- doesFileExist actualFilePath
   if not fileExists
     then pure (moduleName, Nothing, False)
     else do
-      result <- try (parseModuleComplete filePath moduleName) :: IO (Either SomeException ParsedModule)
+      -- Find the specific cabal config for this file
+      let maybeCabalConfig = findCabalForFile actualFilePath cabalConfigs
+      result <- case maybeCabalConfig of
+        Just cabalConfig -> do
+          -- putStrLn $ "Using cabal config " ++ cabalPackageName cabalConfig ++ " for module " ++ moduleName
+          try (runGhc (Just libdir) $ parseModuleWithCabal actualFilePath cabalConfig filePath moduleName) :: IO (Either SomeException ParsedModule)
+        Nothing -> do
+          -- putStrLn $ "No cabal config found for " ++ moduleName ++ ", using default flags"
+          pure $ Left $ toException $ SomeCompilerException ("cabal config not found" :: Text)
       
       case result of
         Right val -> pure (moduleName, Just val, True)
@@ -525,7 +842,7 @@ processModuleSafe isTried actualFilePath moduleName path localRepoPath = do
                 | "Could not find module 'Data.Record.Plugin" `isInfixOf` errMsg = "Plugin"
                 | any (`isInfixOf` errMsg) ["parse error on input `→'", "parse error on input `∀'", 
                                            "parse error on input `←'", "parse error on input `∷'",
-                                           "parse error on input `⇒'"] = "Unicode"
+                                           "parse error on input `⇒'", "parse error on input `(#'"] = "Unicode"
                 | "Lambda-syntax in pattern" `isInfixOf` errMsg = "LambdaPattern"
                 | "Operator applied to too few arguments" `isInfixOf` errMsg = "Operator"
                 | "Parse error in pattern" `isInfixOf` errMsg = "PatternError"
@@ -721,19 +1038,31 @@ run = do
       [repoUrl, localRepoPath, branchName, currentCommit, path] -> do
           cloneRepo repoUrl localRepoPath
           cabalpaths <- findCabalFiles localRepoPath
+          
+          -- Parse all Cabal files to extract configuration
+          putStrLn $ "Found " ++ show (length cabalpaths) ++ " cabal files"
+          cabalConfigs <- parseAllCabalFiles cabalpaths
+          putStrLn $ "Successfully parsed " ++ show (length cabalConfigs) ++ " cabal configurations"
+          mapM_ (\cfg -> putStrLn $ "  - " ++ cabalPackageName cfg ++ 
+                                   " (extensions: " ++ show (length (cabalExtensions cfg)) ++ 
+                                   ", src dirs: " ++ show (cabalSourceDirs cfg) ++ ")") cabalConfigs
+          
           changedFiles <- getChangedFiles branchName currentCommit localRepoPath
           let modifiedModsAndPaths = extractModuleNames (traceShowId $ generateProjectRoots cabalpaths) changedFiles
-          print ("modified files: " <> show changedFiles)
-          print ("modified files: " <> show modifiedModsAndPaths)
+          -- print ("modified files: " <> show changedFiles)
+          -- print ("modified files: " <> show modifiedModsAndPaths)
           
-          -- Process modules for previous commit
-          maybePreviousAST <- mapM (\(m, p, fp) -> processModuleSafe False fp m p localRepoPath) modifiedModsAndPaths
+          -- Process modules for previous commit with Cabal config (in parallel)
+          maybePreviousAST <- mapConcurrently (\(m, p, fp) -> processModuleSafe cabalConfigs False fp m p localRepoPath) modifiedModsAndPaths
           
           -- Switch to current commit
           _ <- readProcess "git" ["checkout", currentCommit] ""
           
-          -- Process modules for current commit
-          maybeCurrentAST <- mapM (\(m, p, fp) -> processModuleSafe False fp m p localRepoPath) modifiedModsAndPaths
+          -- Re-parse cabal files for current commit (in case they changed)
+          cabalConfigsCurrent <- parseAllCabalFiles cabalpaths
+          
+          -- Process modules for current commit with Cabal config (in parallel)
+          maybeCurrentAST <- mapConcurrently (\(m, p, fp) -> processModuleSafe cabalConfigsCurrent False fp m p localRepoPath) modifiedModsAndPaths
           
           -- Pair up the results and separate into different categories
           let listOfAstTuple = zip maybePreviousAST maybeCurrentAST
