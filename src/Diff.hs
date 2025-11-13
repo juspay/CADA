@@ -584,7 +584,7 @@ useDirs workingDirs = do
   void $ setSessionDynFlags dynflags { importPaths = importPaths dynflags ++ workingDirs }
 
 -- Parse module with Cabal configuration (preferred)
-parseModuleWithCabal :: String -> CabalConfig -> FilePath -> String -> Ghc ParsedModule
+parseModuleWithCabal :: String -> CabalConfig -> FilePath -> String -> Ghc (Maybe ParsedModule)
 parseModuleWithCabal actualFilePath cabalConfig modulePath moduleName = do
     useDirs [modulePath]
     dflags <- initGhcFlagsWithCabal actualFilePath cabalConfig [modulePath]
@@ -600,9 +600,9 @@ parseModuleWithCabal actualFilePath cabalConfig modulePath moduleName = do
                 parseModule modSum
     case eRes of
       Left (err :: SomeException) -> do 
-        liftIO $ print err
-        throw err
-      Right val -> pure val
+        liftIO $ print (err,actualFilePath)
+        pure Nothing
+      Right val -> pure $ Just val
 
 -- Extract all declarations from a parsed module
 getAllDecls :: ParsedModule -> [LHsDecl GhcPs]
@@ -826,13 +826,14 @@ processModuleSafe cabalConfigs isTried actualFilePath moduleName path localRepoP
       result <- case maybeCabalConfig of
         Just cabalConfig -> do
           -- putStrLn $ "Using cabal config " ++ cabalPackageName cabalConfig ++ " for module " ++ moduleName
-          try (runGhc (Just libdir) $ parseModuleWithCabal actualFilePath cabalConfig filePath moduleName) :: IO (Either SomeException ParsedModule)
+          try (runGhc (Just libdir) $ parseModuleWithCabal actualFilePath cabalConfig filePath moduleName) :: IO (Either SomeException (Maybe ParsedModule))
         Nothing -> do
           -- putStrLn $ "No cabal config found for " ++ moduleName ++ ", using default flags"
           pure $ Left $ toException $ SomeCompilerException ("cabal config not found" :: Text)
       
       case result of
-        Right val -> pure (moduleName, Just val, True)
+        Right (Just val) -> pure (moduleName, Just val, True)
+        Right Nothing -> pure (moduleName, Nothing, True)
         Left err -> do
           let errMsg = show err
           
@@ -1080,8 +1081,13 @@ run = do
                                   ) newModules
           
           -- Handle completely deleted modules (entire module as "deleted")  
-          deletedModuleChanges <- mapM (\(moduleName, Just ast) -> 
-                                       pure $ getEntireModuleAsChanges moduleName ast False) deletedModules
+          deletedModuleChanges <- catMaybes <$> mapM (\(moduleName, x) -> 
+                                          case x of 
+                                            Just ast -> pure $ Just $ getEntireModuleAsChanges moduleName ast True
+                                            Nothing -> do 
+                                              print ("Module not found " ++ moduleName) 
+                                              pure Nothing
+                                       ) deletedModules
           
           -- Handle modified modules (existing logic)
           modifiedChanges <- mapM (\((moduleName, mPreviousAST), (_, mCurrentAST)) -> do
