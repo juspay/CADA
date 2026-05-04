@@ -3,6 +3,7 @@
 
 module Diff where
 
+import qualified SqlDiff
 import qualified GHC.Data.EnumSet as EnumSet
 import Control.Exception
 import Control.Monad
@@ -1146,7 +1147,42 @@ run = do
                                       allDetailedChanges
             
             writeFile "funs_modified.json" (BLU.toString $ encodePretty functionModifications)
-            
+
+            putStrLn "\n=== Processing SQL Files ==="
+
+            let sqlFiles = filter (".sql" `isSuffixOf`) changedFiles
+            putStrLn $ "Found " ++ show (length sqlFiles) ++ " SQL file(s) in changes"
+
+            case sqlFiles of
+                [] -> putStrLn "No SQL files to process"
+                _  -> do
+                    putStrLn $ "Processing SQL schema changes for files: " ++ show sqlFiles
+                    -- Get old commit hash
+                    oldCommit <- readProcess "git" ["rev-parse", branchName] ""
+                    let oldCommitHash = T.unpack $ T.stripEnd $ T.pack oldCommit
+                    putStrLn $ "Comparing commits: " ++ oldCommitHash ++ " -> " ++ currentCommit
+
+                    -- Process SQL changes
+                    (tableChanges, enumChanges) <- processSqlChanges oldCommitHash currentCommit localRepoPath sqlFiles
+
+                    -- Debug: print table counts
+                    putStrLn $ "SQL tables added: " ++ show (length (SqlDiff.tablesAdded tableChanges))
+                    putStrLn $ "SQL tables removed: " ++ show (length (SqlDiff.tablesRemoved tableChanges))
+                    putStrLn $ "SQL tables modified: " ++ show (length (SqlDiff.tablesModified tableChanges))
+
+                    -- Write table changes to JSON
+                    writeFile "sql_table_changes.json" (BLU.toString $ encodePretty tableChanges)
+                    putStrLn "Table changes written to sql_table_changes.json"
+
+                    -- Debug: print enum counts
+                    putStrLn $ "SQL enums added: " ++ show (length (SqlDiff.enumsAdded enumChanges))
+                    putStrLn $ "SQL enums removed: " ++ show (length (SqlDiff.enumsRemoved enumChanges))
+                    putStrLn $ "SQL enums modified: " ++ show (length (SqlDiff.enumsModified enumChanges))
+
+                    -- Write enum changes to JSON
+                    writeFile "sql_enum_changes.json" (BLU.toString $ encodePretty enumChanges)
+                    putStrLn "Enum changes written to sql_enum_changes.json"
+
             print "Processing complete. Check output files for details."
       _ -> fail $ "Can't proceed. Please pass all the arguments in the order of repoUrl localPath oldCommit newCommit path but got: " <> show x
 
@@ -1194,3 +1230,32 @@ getEntireModuleAsChanges moduleName pmod isAdded =
         modifiedInstances = [],
         deletedInstances = instanceData
     }
+
+-- | Get file content at a specific commit
+getFileAtCommit :: FilePath -> String -> FilePath -> IO (Maybe String)
+getFileAtCommit filePath commitHash localPath = do
+    result <- try $ readProcess "git" ["show", commitHash ++ ":" ++ filePath] ""
+    case result of
+        Right content -> return (Just content)
+        Left (_ :: IOException) -> return Nothing
+
+-- | Process SQL file changes between two commits
+processSqlChanges :: String -> String -> FilePath -> [FilePath] -> IO (SqlDiff.TableChanges, SqlDiff.EnumChanges)
+processSqlChanges oldCommit newCommit localPath sqlFiles = do
+    setCurrentDirectory localPath
+
+    -- Get old version of SQL files
+    oldContents <- mapM (\fp -> do
+        content <- getFileAtCommit fp oldCommit localPath
+        return (fp, content)) sqlFiles
+
+    -- Get new version of SQL files
+    newContents <- mapM (\fp -> do
+        content <- getFileAtCommit fp newCommit localPath
+        return (fp, content)) sqlFiles
+
+    -- Filter out files that don't exist
+    let oldValid = [(fp, c) | (fp, Just c) <- oldContents]
+        newValid = [(fp, c) | (fp, Just c) <- newContents]
+
+    SqlDiff.processSqlFiles oldValid newValid

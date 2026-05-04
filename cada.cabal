@@ -22,21 +22,22 @@ maintainer:         chaitanya.nair@juspay.in
 extra-source-files: CHANGELOG.md
 
 library
-    exposed-modules:  Diff
-    build-depends: 
-        ghc, 
+    exposed-modules:
+        Diff
+        SqlDiff
+    build-depends:
+        ghc,
         aeson-pretty,
         base,
         process,
-        directory, 
-        async, 
-        regex-posix, 
-        unordered-containers, 
-        text, 
-        -- deriving-compat, 
-        regex-compat, 
-        aeson, 
-        utf8-string, 
+        directory,
+        async,
+        regex-posix,
+        unordered-containers,
+        text,
+        regex-compat,
+        aeson,
+        utf8-string,
         extra,
         ghc-boot
         , uniplate
@@ -48,6 +49,8 @@ library
         , Cabal >= 3.0
         , Cabal-syntax >= 3.0
         , exceptions
+        , megaparsec
+        , parser-combinators
     hs-source-dirs:   src
     default-language: Haskell2010
 
