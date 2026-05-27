@@ -25,6 +25,7 @@ library
     exposed-modules:
         Diff
         SqlDiff
+        Validation
     build-depends:
         ghc,
         aeson-pretty,
@@ -41,8 +42,6 @@ library
         extra,
         ghc-boot
         , uniplate
-        , references
-        , classyplate
         , ghc-paths
         , bytestring
         , filepath
@@ -51,6 +50,7 @@ library
         , exceptions
         , megaparsec
         , parser-combinators
+        , simple-sql-parser
     hs-source-dirs:   src
     default-language: Haskell2010
 
