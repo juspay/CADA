@@ -3,6 +3,8 @@
 
 module Diff where
 
+import qualified SqlDiff
+import qualified Validation
 import qualified GHC.Data.EnumSet as EnumSet
 import Control.Exception
 import Control.Monad
@@ -26,6 +28,7 @@ import GHC.Paths (libdir)
 import GHC
 import qualified GHC.Driver.Session as GHC
 import GHC.Utils.Outputable hiding ((<>))
+import GHC.Driver.Config.Parser (initParserOpts)
 import GHC.Driver.Flags
 import GHC.Driver.Session
 import GHC.LanguageExtensions.Type hiding (Extension)
@@ -48,7 +51,7 @@ import GHC.Data.FastString
 import Text.Regex.Posix
 import qualified GHC.LanguageExtensions as LangExt
 import Data.Generics.Uniplate.Data ()
-import Control.Reference ((^.), (!~), biplateRef,(^?))
+import Data.Generics.Uniplate.Operations (universeBi)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import System.Directory (doesDirectoryExist, listDirectory)
@@ -70,7 +73,7 @@ import Distribution.ModuleName (ModuleName)
 import qualified Distribution.ModuleName as ModuleName
 import Language.Haskell.Extension (Extension(..), KnownExtension)
 import qualified Language.Haskell.Extension as Ext
-import Distribution.Verbosity (normal)
+import Distribution.Verbosity (normal, Verbosity)
 import Distribution.Utils.Path (getSymbolicPath)
 import qualified GHC.LanguageExtensions as LangExt
 import qualified Language.Haskell.Extension as Cabal
@@ -187,6 +190,13 @@ data CabalConfig = CabalConfig {
     cabalBasePath :: FilePath,
     cabalDefaultLanguage :: Maybe Cabal.Language
 } deriving (Show)
+
+readGenericPackageDescription :: Verbosity -> FilePath -> IO GenericPackageDescription
+readGenericPackageDescription _ path = do
+    bs <- BS.readFile path
+    case snd (runParseResult (parseGenericPackageDescription bs)) of
+        Left _ -> fail $ "Failed to parse cabal file: " ++ path
+        Right result -> return result
 
 -- Parse a single .cabal file and extract configuration for ALL components
 parseCabalFile :: FilePath -> IO [CabalConfig]
@@ -344,7 +354,7 @@ cabalKnownExtToGhcExt ext = case ext of
   Cabal.Arrows                        -> Just LangExt.Arrows
   Cabal.Generics                      -> Nothing  -- Deprecated, no direct mapping
   Cabal.ImplicitPrelude               -> Just LangExt.ImplicitPrelude
-  Cabal.NamedFieldPuns                -> Just LangExt.RecordPuns
+  Cabal.NamedFieldPuns                -> Just LangExt.NamedFieldPuns
   Cabal.PatternGuards                 -> Just LangExt.PatternGuards
   Cabal.GeneralizedNewtypeDeriving    -> Just LangExt.GeneralizedNewtypeDeriving
   Cabal.GeneralisedNewtypeDeriving    -> Just LangExt.GeneralizedNewtypeDeriving
@@ -361,7 +371,7 @@ cabalKnownExtToGhcExt ext = case ext of
   Cabal.LiberalTypeSynonyms           -> Just LangExt.LiberalTypeSynonyms
   Cabal.TypeOperators                 -> Just LangExt.TypeOperators
   Cabal.RecordWildCards               -> Just LangExt.RecordWildCards
-  Cabal.RecordPuns                    -> Just LangExt.RecordPuns
+  Cabal.RecordPuns                    -> Just LangExt.NamedFieldPuns
   Cabal.DisambiguateRecordFields      -> Just LangExt.DisambiguateRecordFields
   Cabal.TraditionalRecordSyntax       -> Just LangExt.TraditionalRecordSyntax
   Cabal.OverloadedStrings             -> Just LangExt.OverloadedStrings
@@ -529,7 +539,7 @@ initGhcFlagsWithCabal actualFilePath cabalConfig extraDirs = do
                                   case mExt of 
                                     Just ext -> if onOrOff then xopt_set acc ext else xopt_unset acc ext
                                     Nothing -> acc) x enabledCabalExts) <$> getSessionDynFlags
-    src_opts <- liftIO $ getOptionsFromFile dflags''' actualFilePath
+    (_msgs, src_opts) <- liftIO $ getOptionsFromFile (initParserOpts dflags''') actualFilePath
     (dflags', leftovers, warns) <- parseDynamicFilePragma dflags''' src_opts
     _ <- setSessionDynFlags $ applyImpliedExtensionsComplete $ (\x -> 
                                       x `gopt_set` Opt_KeepRawTokenStream
@@ -589,7 +599,7 @@ parseModuleWithCabal actualFilePath cabalConfig modulePath moduleName = do
     useDirs [modulePath]
     dflags <- initGhcFlagsWithCabal actualFilePath cabalConfig [modulePath]
     eRes <- MC.try $ do
-        target <- guessTarget moduleName Nothing
+        target <- guessTarget moduleName Nothing Nothing
         setTargets [target]
         -- loadStatus <- load LoadAllTargets
         modGraph <- depanal [] False
@@ -701,7 +711,7 @@ getSourceLocation srcSpan = case srcSpan of
 -- Extract function calls from a declaration
 extractFunctionCalls :: HsDecl GhcPs -> [String]
 extractFunctionCalls (ValD _ bind) = 
-    let calls = bind ^? biplateRef :: [Name]
+    let calls = universeBi bind :: [Name]
     in map (showSDocUnsafe . ppr) calls
 extractFunctionCalls _ = []
 
@@ -731,7 +741,7 @@ extractFunctionCalls _ = []
 -- Extract literals from a declaration
 extractLiterals :: HsDecl GhcPs -> [(String, String)]
 extractLiterals (ValD _ bind) = 
-    let literals = bind ^? biplateRef :: [HsLit GhcPs]
+    let literals = universeBi bind :: [HsLit GhcPs]
     in map extractLit literals
 extractLiterals _ = []
 
@@ -962,7 +972,7 @@ getAllChangesWithCode newFuns oldFuns addedFns
         Just decl <- [HM.lookup k old]]
 
 -- Create output files with changes
-createCodeFiles :: [DetailedChanges] -> IO ()
+createCodeFiles :: [DetailedChanges] -> IO (Value, Value)
 createCodeFiles changes = do
   -- Write the pretty-printed detailed JSON
   writeFile "all_code_changes.json" 
@@ -1030,6 +1040,7 @@ createCodeFiles changes = do
   writeFile "function_changes.json" (BLU.toString $ encodePretty allFunctionChanges)
   writeFile "type_changes.json" (BLU.toString $ encodePretty allTypeChanges)
   writeFile "instance_changes.json" (BLU.toString $ encodePretty allInstanceChanges)
+  pure (allTypeChanges, allInstanceChanges)
 
 -- Main entry point
 run :: IO ()
@@ -1135,7 +1146,7 @@ run = do
             let allDetailedChanges = newModuleChanges ++ deletedModuleChanges ++ modifiedChanges
             
             -- Create output files
-            createCodeFiles allDetailedChanges
+            (typeChangesFile, instanceChangesFile) <- createCodeFiles allDetailedChanges
             
             -- Also create the original function modification summary
             let functionModifications = map (\changes -> 
@@ -1146,8 +1157,58 @@ run = do
                                       allDetailedChanges
             
             writeFile "funs_modified.json" (BLU.toString $ encodePretty functionModifications)
-            
-            print "Processing complete. Check output files for details."
+
+            putStrLn "\n=== Processing SQL Files ==="
+
+            let sqlFiles = filter (".sql" `isSuffixOf`) changedFiles
+            putStrLn $ "Found " ++ show (length sqlFiles) ++ " SQL file(s) in changes"
+
+            (sqlTableDelta, sqlEnumDelta, sqlParsingErrors) <-
+              case sqlFiles of
+                [] -> do
+                    putStrLn "No SQL files to process"
+                    pure (SqlDiff.AllTableChanges [] [] [], SqlDiff.EnumChanges [] [] [], [])
+                _  -> do
+                    putStrLn $ "Processing SQL schema changes for files: " ++ show sqlFiles
+                    -- Get old commit hash
+                    oldCommit <- readProcess "git" ["rev-parse", branchName] ""
+                    let oldCommitHash = T.unpack $ T.stripEnd $ T.pack oldCommit
+                    putStrLn $ "Comparing commits: " ++ oldCommitHash ++ " -> " ++ currentCommit
+
+                    -- Process SQL changes
+                    (sqlTableDelta, sqlEnumDelta, sqlParsingErrors) <- processSqlChanges oldCommitHash currentCommit localRepoPath sqlFiles
+
+                    writeFile "sql_table_delta.json" (BLU.toString $ encodePretty sqlTableDelta)
+                    writeFile "sql_enum_delta.json" (BLU.toString $ encodePretty sqlEnumDelta)
+                    pure (sqlTableDelta, sqlEnumDelta, sqlParsingErrors)
+
+            if not $ null sqlParsingErrors
+              then do
+                writeFile "sql_parsing_errors.txt" (intercalate "\n" sqlParsingErrors)
+                fail $ "Failed to parse sql files"
+              else
+                case (fromJSON typeChangesFile, fromJSON instanceChangesFile) of
+                  (Success typeChanges, Success instanceChanges) -> do
+                    hsTableDelta <- Validation.writeHsTableDelta typeChanges
+                    hsEnumDelta <- Validation.writeHsEnumDelta instanceChanges
+
+                    let hsTableValidationResult = Validation.compareAllTableChanges sqlTableDelta hsTableDelta
+                        hsEnumValidationResult = Validation.compareAllEnumChanges sqlEnumDelta hsEnumDelta
+                        hsFinalValidationResult = Validation.ValidationResult
+                                                  (Validation.vrErrors hsTableValidationResult ++ Validation.vrErrors hsEnumValidationResult)
+                                                  (Validation.vrPassed hsTableValidationResult && Validation.vrPassed hsEnumValidationResult)
+
+                    let sqlTableValidationResult = Validation.compareAllTableChanges hsTableDelta sqlTableDelta
+                        sqlEnumValidationResult = Validation.compareAllEnumChanges hsEnumDelta sqlEnumDelta
+                        sqlFinalValidationResult = Validation.ValidationResult
+                                                  (Validation.vrErrors sqlTableValidationResult ++ Validation.vrErrors sqlEnumValidationResult)
+                                                  (Validation.vrPassed sqlTableValidationResult && Validation.vrPassed sqlEnumValidationResult)
+
+                    writeFile "hs_validation_result.json" (BLU.toString $ encodePretty hsFinalValidationResult)
+                    writeFile "sql_validation_result.json" (BLU.toString $ encodePretty sqlFinalValidationResult)
+
+                  _ -> fail $ "Invalid Format for type_changes.json or instance_changes.json"
+
       _ -> fail $ "Can't proceed. Please pass all the arguments in the order of repoUrl localPath oldCommit newCommit path but got: " <> show x
 
 partitionModules :: [((String, Maybe ParsedModule, Bool), (String, Maybe ParsedModule, Bool))] 
@@ -1194,3 +1255,31 @@ getEntireModuleAsChanges moduleName pmod isAdded =
         modifiedInstances = [],
         deletedInstances = instanceData
     }
+
+-- | Get file content at a specific commit
+getFileAtCommit :: FilePath -> String -> FilePath -> IO (Maybe String)
+getFileAtCommit filePath commitHash localPath = do
+    result <- try $ readProcess "git" ["show", commitHash ++ ":" ++ filePath] ""
+    case result of
+        Right content -> return (Just content)
+        Left (_ :: IOException) -> return Nothing
+
+processSqlChanges :: String -> String -> FilePath -> [FilePath] -> IO (SqlDiff.AllTableChanges, SqlDiff.EnumChanges, [SqlDiff.ErrorMessage])
+processSqlChanges oldCommit newCommit localPath sqlFiles = do
+    setCurrentDirectory localPath
+
+    -- Get old version of SQL files
+    oldContents <- mapM (\fp -> do
+        content <- getFileAtCommit fp oldCommit localPath
+        return (fp, content)) sqlFiles
+
+    -- Get new version of SQL files
+    newContents <- mapM (\fp -> do
+        content <- getFileAtCommit fp newCommit localPath
+        return (fp, content)) sqlFiles
+
+    -- Filter out files that don't exist
+    let oldValid = [(fp, c) | (fp, Just c) <- oldContents]
+        newValid = [(fp, c) | (fp, Just c) <- newContents]
+
+    SqlDiff.processSqlFiles oldValid newValid
